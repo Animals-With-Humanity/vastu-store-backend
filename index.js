@@ -16,7 +16,7 @@ const cors         = require('cors');
 const crypto       = require('crypto');
 const Razorpay     = require('razorpay');
 const admin        = require('firebase-admin');
-const serviceAccount = require('./serviceAccountKey.json'); // ← Firebase service account
+const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
 
 // ─── Firebase Admin ────────────────────────────────────────────────────────────
 admin.initializeApp({
