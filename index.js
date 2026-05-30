@@ -11,7 +11,7 @@
  *   GET  /health             — Uptime check
  */
 
-<<<<<<< HEAD
+
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -19,14 +19,7 @@ const Razorpay = require('razorpay');
 const admin = require('firebase-admin');
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
 // const serviceAccount = require('./serviceAccountKey.json');
-=======
-const express      = require('express');
-const cors         = require('cors');
-const crypto       = require('crypto');
-const Razorpay     = require('razorpay');
-const admin        = require('firebase-admin');
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
->>>>>>> 95a1c20d6eac70884eb0152f41ac03c475e26b52
+
 
 // ─── Firebase Admin ────────────────────────────────────────────────────────────
 admin.initializeApp({
