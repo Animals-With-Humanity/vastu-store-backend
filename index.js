@@ -11,7 +11,6 @@
  *   GET  /health             — Uptime check
  */
 
-<<<<<<< HEAD
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -19,14 +18,6 @@ const Razorpay = require('razorpay');
 const admin = require('firebase-admin');
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
 // const serviceAccount = require('./serviceAccountKey.json');
-=======
-const express      = require('express');
-const cors         = require('cors');
-const crypto       = require('crypto');
-const Razorpay     = require('razorpay');
-const admin        = require('firebase-admin');
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
->>>>>>> 95a1c20d6eac70884eb0152f41ac03c475e26b52
 
 // ─── Firebase Admin ────────────────────────────────────────────────────────────
 admin.initializeApp({
@@ -108,7 +99,7 @@ async function sendOrderEmail(orderData) {
   const emailHtml = `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
       <div style="text-align: center; margin-bottom: 20px;">
-        <img src="https://awhbharat.org/assets/images/logo.png" alt="AWH Logo" style="width: 80px; height: 80px;" />
+        <img src="https://vastu.awhbharat.org/vastu-circular.PNG" alt="AWH Logo" style="width: 80px; height: 80px;" />
         <h2 style="color: #70355c; margin-top: 10px;">Thank you for your support! 🐾</h2>
         <p style="color: #666;">Every purchase helps save lives and fund animal rescue in Bhopal.</p>
       </div>
@@ -181,6 +172,7 @@ async function sendOrderEmail(orderData) {
     await mailTransporter.sendMail({
       from: process.env.EMAIL_FROM || '"VASTU x AWH" <team@awhbharat.org>',
       to: customer.email,
+      bcc: process.env.EMAIL_BCC,
       subject: `🐾 Order Confirmed! - VASTU x AWH`,
       html: emailHtml
     });
@@ -372,6 +364,15 @@ async function confirmOrder(orderId, paymentId, customer, source) {
       productMap[uniqueProductIds[i]] = productSnaps[i];
     }
 
+    // ── READ coupon doc BEFORE any writes (Firestore transaction rule) ──────────
+    let couponRef = null;
+    let couponSnap = null;
+    if (orderData.couponDocId) {
+      couponRef = db.collection('coupons').doc(orderData.couponDocId);
+      couponSnap = await transaction.get(couponRef);
+    }
+
+    // ── NOW do all writes ────────────────────────────────────────────────────────
     const productUpdates = {};
 
     for (const key of uniqueKeys) {
@@ -412,15 +413,11 @@ async function confirmOrder(orderId, paymentId, customer, source) {
       transaction.update(db.collection('products').doc(prodId), productUpdates[prodId]);
     }
 
-    // 2. Increment coupon usage count if applicable
-    if (orderData.couponDocId) {
-      const couponRef = db.collection('coupons').doc(orderData.couponDocId);
-      const couponSnap = await transaction.get(couponRef);
-      if (couponSnap.exists) {
-        transaction.update(couponRef, {
-          usedCount: admin.firestore.FieldValue.increment(1)
-        });
-      }
+    // 2. Increment coupon usage count if applicable (write only, read was done above)
+    if (couponRef && couponSnap && couponSnap.exists) {
+      transaction.update(couponRef, {
+        usedCount: admin.firestore.FieldValue.increment(1)
+      });
     }
 
     // 3. Update the order document to 'paid' status
