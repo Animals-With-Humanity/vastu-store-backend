@@ -184,6 +184,113 @@ describe('POST /verify-payment', () => {
   // WHY: Email delivery failures (SMTP down, bad address, etc.) must never
   // fail the payment-verification response — the payment already went
   // through, so the customer-facing result must still be success.
+  // WHY: confirmOrder() has its own, separate stock check inside the
+  // transaction (distinct from computeAmount's check at /create-order
+  // time). This test targets the variant-specific branch of that check
+  // (isVariant = true), which is a different code path than the
+  // non-variant out-of-stock test (VP-07) and was never exercised.
+  it('VP-10: variant-specific stock shortfall at confirmation time is rejected', async () => {
+    fbMock.__setProduct('prod2', {
+      name: 'Premium Bed', price: 600, active: true, stock: 999,
+      variants: { Large: { price: 800, stock: 1 } }, // only 1 Large left
+    });
+    fbMock.__setOrder('order_1', {
+      ...baseOrderDoc(),
+      items: [{ id: 'prod2', name: 'Premium Bed', variant: 'Large', qty: 3, price: 800 }],
+    });
+
+    const res = await request(app).post('/verify-payment').send({
+      razorpay_order_id: 'order_1',
+      razorpay_payment_id: 'pay_1',
+      razorpay_signature: sign('order_1', 'pay_1'),
+    });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toContain('Out of stock for Premium Bed (Large)');
+    expect(res.body.error).toContain('Available: 1, Requested: 3');
+  });
+
+  // WHY: Simulates a product being deleted from the catalog in the window
+  // between checkout (/create-order) and payment confirmation
+  // (/verify-payment) — confirmOrder must reject rather than silently
+  // confirm an order for a product that no longer exists.
+  it('VP-11: a product removed from the catalog before confirmation is rejected', async () => {
+    // Deliberately NOT calling fbMock.__setProduct — product doc is missing.
+    fbMock.__setOrder('order_1', baseOrderDoc());
+
+    const res = await request(app).post('/verify-payment').send({
+      razorpay_order_id: 'order_1',
+      razorpay_payment_id: 'pay_1',
+      razorpay_signature: sign('order_1', 'pay_1'),
+    });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe('Product not found: prod1');
+  });
+
+  // WHY: Products with no `stock` field are treated as unlimited (stock
+  // resolves to -1, which skips the quantity check entirely) — a large
+  // order quantity must succeed rather than being rejected.
+  it('VP-12: a product with no stock field (unlimited stock) confirms regardless of quantity', async () => {
+    fbMock.__setProduct('prod1', { name: 'Digital Donation Certificate', price: 100, active: true });
+    // no `stock` key at all
+    fbMock.__setOrder('order_1', {
+      ...baseOrderDoc(),
+      items: [{ id: 'prod1', name: 'Digital Donation Certificate', variant: null, qty: 500, price: 100 }],
+    });
+
+    const res = await request(app).post('/verify-payment').send({
+      razorpay_order_id: 'order_1',
+      razorpay_payment_id: 'pay_1',
+      razorpay_signature: sign('order_1', 'pay_1'),
+    });
+
+    expect(res.status).toBe(200);
+    expect(fbMock.__getOrder('order_1').status).toBe('paid');
+  });
+
+  // WHY: If the coupon document referenced by an order was deleted between
+  // checkout and confirmation, the transaction must still confirm the
+  // order successfully — it just skips the usage-count increment rather
+  // than throwing. Covers the `couponSnap.exists === false` branch.
+  it('VP-13: a coupon document deleted before confirmation does not block the order', async () => {
+    fbMock.__setProduct('prod1', { name: 'Dog Bed', price: 500, active: true, stock: 10 });
+    // Deliberately NOT calling fbMock.__setCoupon — couponDocId points nowhere.
+    fbMock.__setOrder('order_1', { ...baseOrderDoc(), couponDocId: 'coupon_deleted' });
+
+    const res = await request(app).post('/verify-payment').send({
+      razorpay_order_id: 'order_1',
+      razorpay_payment_id: 'pay_1',
+      razorpay_signature: sign('order_1', 'pay_1'),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.verified).toBe(true);
+  });
+
+  // WHY: sendOrderEmail's guard is `if (!customer || !customer.email) return;`
+  // — VP-08 already covers the "customer is null" side of that OR, but
+  // branch coverage requires exercising "customer exists but has no email"
+  // too (e.g. a customer record saved without an email address).
+  it('VP-14: a customer record with no email address skips sending the confirmation email', async () => {
+    fbMock.__setProduct('prod1', { name: 'Dog Bed', price: 500, active: true, stock: 10 });
+    fbMock.__setOrder('order_1', {
+      ...baseOrderDoc(),
+      customer: { firstName: 'Asha', lastName: 'K', phone: '9999999999',
+        address: { line1: 'A1', city: 'Bhopal', state: 'MP', pin: '462001' } }, // no `email` field
+    });
+
+    const res = await request(app).post('/verify-payment').send({
+      razorpay_order_id: 'order_1',
+      razorpay_payment_id: 'pay_1',
+      razorpay_signature: sign('order_1', 'pay_1'),
+    });
+
+    expect(res.status).toBe(200);
+    await new Promise((r) => setImmediate(r));
+    expect(mockSendMail).not.toHaveBeenCalled();
+  });
+
   it('VP-09: email send failure does not affect the verified response', async () => {
     fbMock.__setProduct('prod1', { name: 'Dog Bed', price: 500, active: true, stock: 10 });
     fbMock.__setOrder('order_1', {

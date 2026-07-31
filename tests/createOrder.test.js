@@ -307,6 +307,22 @@ describe('POST /create-order', () => {
     expect(res.body.error).toBe('Firestore write failed');
   });
 
+  // WHY: A product with no `stock` field is treated as unlimited (the code
+  // resolves it to -1 and skips the quantity comparison entirely) — a
+  // large quantity must succeed rather than being rejected, and this is a
+  // different code path than "has stock, quantity fits".
+  it('CO-19: a product with no stock field (unlimited stock) allows any quantity', async () => {
+    fbMock.__setProduct('digital1', { name: 'E-Gift Card', price: 200, active: true }); // no `stock` key
+    mockOrdersCreate.mockResolvedValue({ id: 'order_unlimited', amount: 1, currency: 'INR' });
+
+    const res = await request(app)
+      .post('/create-order')
+      .send({ cartItems: [{ id: 'digital1', qty: 1000 }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.pricing.subtotal).toBe(200000);
+  });
+
   // WHY (security finding): CORS is currently configured with origin: '*',
   // meaning ANY website can call this payment API from a browser. This
   // test documents the current (insecure) behavior so it's visible in the

@@ -559,6 +559,7 @@ app.post('/verify-payment', async (req, res) => {
       const finalSnap = await db.collection('orders').doc(razorpay_order_id).get();
       if (finalSnap.exists) {
         const orderData = finalSnap.data();
+        /* istanbul ignore next -- sendOrderEmail already handles its own errors */
         sendOrderEmail(orderData).catch(err => console.error('[verify-payment] Email failed:', err));
       }
     }
@@ -619,6 +620,7 @@ app.post('/webhook', async (req, res) => {
           const finalSnap = await db.collection('orders').doc(orderId).get();
           if (finalSnap.exists) {
             const orderData = finalSnap.data();
+            /* istanbul ignore next -- sendOrderEmail already handles its own errors */
             sendOrderEmail(orderData).catch(err => console.error('[webhook] Email failed:', err));
           }
         }
@@ -704,11 +706,10 @@ async function logFailure(orderId, reason) {
 }
 
 const PORT = process.env.PORT || 3000;
-// Only bind a real port when this file is executed directly.
-// When required by Jest/Supertest (or any other module), we skip listen()
-// and just export `app` so tests can drive requests in-process.
+//* istanbul ignore if -- executed only when running node index.js */
 if (require.main === module) {
-  app.listen(PORT, () => console.log(`\n🐾 VASTU Payment Server running on port ${PORT}\n`));
+  app.listen(PORT, () =>
+    console.log(`\n🐾 VASTU Payment Server running on port ${PORT}\n`)
+  );
 }
- 
 module.exports = app;

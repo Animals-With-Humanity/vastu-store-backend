@@ -195,6 +195,20 @@ describe('POST /webhook', () => {
     expect(fbMock.__getOrder('order_1').status).toBe('order_paid_webhook');
   });
 
+  // WHY: order.paid's order-status update is wrapped in its own
+  // `.catch(() => {})`, separate from payment.failed's — this specifically
+  // exercises THAT swallow when the referenced order doesn't exist, rather
+  // than assuming payment.failed's coverage (WH-08) implies this one too.
+  it('WH-09b: order.paid for a non-existent order is swallowed, still returns 200', async () => {
+    const res = await signedPost({
+      event: 'order.paid',
+      payload: { order: { entity: { id: 'order_does_not_exist' } } },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.received).toBe(true);
+  });
+
   // WHY: Razorpay may add new event types over time; unrecognized events
   // must be a harmless no-op, never a crash.
   it('WH-10: an unrecognized event type is a no-op that still returns 200', async () => {
