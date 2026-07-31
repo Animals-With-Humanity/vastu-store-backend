@@ -10,13 +10,16 @@
  *   POST /payment-failed     — Log failures for manual review
  *   GET  /health             — Uptime check
  */
-
+const dotenv = require('dotenv');
+dotenv.config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const admin = require('firebase-admin');
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+
 // const serviceAccount = require('./serviceAccountKey.json');
 
 // ─── Firebase Admin ────────────────────────────────────────────────────────────
@@ -701,4 +704,11 @@ async function logFailure(orderId, reason) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`\n🐾 VASTU Payment Server running on port ${PORT}\n`));
+// Only bind a real port when this file is executed directly.
+// When required by Jest/Supertest (or any other module), we skip listen()
+// and just export `app` so tests can drive requests in-process.
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`\n🐾 VASTU Payment Server running on port ${PORT}\n`));
+}
+ 
+module.exports = app;
