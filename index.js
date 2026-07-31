@@ -10,13 +10,16 @@
  *   POST /payment-failed     — Log failures for manual review
  *   GET  /health             — Uptime check
  */
-
+const dotenv = require('dotenv');
+dotenv.config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const admin = require('firebase-admin');
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+
 // const serviceAccount = require('./serviceAccountKey.json');
 
 // ─── Firebase Admin ────────────────────────────────────────────────────────────
@@ -556,6 +559,7 @@ app.post('/verify-payment', async (req, res) => {
       const finalSnap = await db.collection('orders').doc(razorpay_order_id).get();
       if (finalSnap.exists) {
         const orderData = finalSnap.data();
+        /* istanbul ignore next -- sendOrderEmail already handles its own errors */
         sendOrderEmail(orderData).catch(err => console.error('[verify-payment] Email failed:', err));
       }
     }
@@ -616,6 +620,7 @@ app.post('/webhook', async (req, res) => {
           const finalSnap = await db.collection('orders').doc(orderId).get();
           if (finalSnap.exists) {
             const orderData = finalSnap.data();
+            /* istanbul ignore next -- sendOrderEmail already handles its own errors */
             sendOrderEmail(orderData).catch(err => console.error('[webhook] Email failed:', err));
           }
         }
@@ -701,4 +706,10 @@ async function logFailure(orderId, reason) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`\n🐾 VASTU Payment Server running on port ${PORT}\n`));
+//* istanbul ignore if -- executed only when running node index.js */
+if (require.main === module) {
+  app.listen(PORT, () =>
+    console.log(`\n🐾 VASTU Payment Server running on port ${PORT}\n`)
+  );
+}
+module.exports = app;
