@@ -148,6 +148,26 @@ describe('POST /webhook', () => {
     expect(res.body.warning).toBeDefined();
   });
 
+  // WHY: Webhook can arrive after another buyer took the last units.
+  // Money is already captured — persist confirmation_rejected for refunds,
+  // and still return 200 so Razorpay does not retry-storm.
+  it('WH-06b: payment.captured with insufficient stock marks confirmation_rejected', async () => {
+    fbMock.__setProduct('prod1', { name: 'Dog Bed', price: 500, active: true, stock: 0 });
+    fbMock.__setOrder('order_1', baseOrderDoc());
+
+    const res = await signedPost({
+      event: 'payment.captured',
+      payload: { payment: { entity: { id: 'pay_1', order_id: 'order_1' } } },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warning).toBeDefined();
+    const o = fbMock.__getOrder('order_1');
+    expect(o.status).toBe('confirmation_rejected');
+    expect(o.needsRefund).toBe(true);
+    expect(o.razorpayPaymentId).toBe('pay_1');
+  });
+
   // WHY: Failed payments must be recorded for the ops/support team, and
   // the order status flipped so it doesn't look "pending" forever.
   it('WH-07: payment.failed logs to failed_payments and marks the order failed', async () => {

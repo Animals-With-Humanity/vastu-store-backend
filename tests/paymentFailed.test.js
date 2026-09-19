@@ -88,4 +88,19 @@ describe('POST /payment-failed', () => {
     expect(res.status).toBe(200);
     expect(res.body.logged).toBe(true);
   });
+
+  // WHY: If verify-payment already recorded a captured-but-unconfirmed
+  // payment, a later modal-dismiss must not hide it from the refund queue.
+  it('PF-06: does not overwrite confirmation_rejected with abandoned', async () => {
+    fbMock.__setOrder('order_1', { status: 'confirmation_rejected', needsRefund: true });
+
+    const res = await request(app).post('/payment-failed').send({
+      orderId: 'order_1',
+      error: { description: 'User dismissed payment modal' },
+    });
+
+    expect(res.status).toBe(200);
+    expect(fbMock.__getOrder('order_1').status).toBe('confirmation_rejected');
+    expect(fbMock.__getOrder('order_1').needsRefund).toBe(true);
+  });
 });

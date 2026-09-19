@@ -161,6 +161,14 @@ describe('POST /verify-payment', () => {
     expect(res.status).toBe(500);
     expect(res.body.verified).toBe(false);
     expect(res.body.error).toContain('Out of stock for Dog Bed');
+    expect(res.body.confirmationRejected).toBe(true);
+    expect(res.body.reason).toBe('out_of_stock');
+    expect(res.body.paymentId).toBe('pay_1');
+    const rejected = fbMock.__getOrder('order_1');
+    expect(rejected.status).toBe('confirmation_rejected');
+    expect(rejected.needsRefund).toBe(true);
+    expect(rejected.refunded).toBe(false);
+    expect(rejected.razorpayPaymentId).toBe('pay_1');
   });
 
   // WHY: `customer` is optional in the request body (e.g. guest checkout
