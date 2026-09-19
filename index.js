@@ -63,10 +63,17 @@ app.use(cors({
 const nodemailer = require('nodemailer');
 
 // Setup NodeMailer Transporter
+
+const emailPort = parseInt(process.env.EMAIL_PORT || '465', 10);
 const mailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_PASS) ? nodemailer.createTransport({
-  host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-  port: parseInt(process.env.EMAIL_PORT || '587'),
-  secure: process.env.EMAIL_PORT === '465',
+  host: process.env.EMAIL_HOST || 'smtp.zoho.in',
+  port: emailPort,
+  secure: emailPort === 465,
+  requireTLS: emailPort === 587,
+  family: 4,
+  connectionTimeout: 20000,
+  greetingTimeout: 20000,
+  socketTimeout: 30000,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
