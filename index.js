@@ -10,13 +10,16 @@
  *   POST /payment-failed     — Log failures for manual review
  *   GET  /health             — Uptime check
  */
-
+const dotenv = require('dotenv');
+dotenv.config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const admin = require('firebase-admin');
+
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+
 // const serviceAccount = require('./serviceAccountKey.json');
 
 // ─── Firebase Admin ────────────────────────────────────────────────────────────
@@ -60,10 +63,17 @@ app.use(cors({
 const nodemailer = require('nodemailer');
 
 // Setup NodeMailer Transporter
+
+const emailPort = parseInt(process.env.EMAIL_PORT || '465', 10);
 const mailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_PASS) ? nodemailer.createTransport({
-  host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-  port: parseInt(process.env.EMAIL_PORT || '587'),
-  secure: process.env.EMAIL_PORT === '465',
+  host: process.env.EMAIL_HOST || 'smtp.zoho.in',
+  port: emailPort,
+  secure: emailPort === 465,
+  requireTLS: emailPort === 587,
+  family: 4,
+  connectionTimeout: 20000,
+  greetingTimeout: 20000,
+  socketTimeout: 30000,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
@@ -76,11 +86,11 @@ const mailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_PASS) ? nod
 async function sendOrderEmail(orderData) {
   if (!mailTransporter) {
     console.log('[Email] Mail transporter not configured. Skipping email.');
-    return;
+    return false;
   }
 
   const customer = orderData.customer;
-  if (!customer || !customer.email) return;
+  if (!customer || !customer.email) return false;
 
   const itemsList = (orderData.items || []).map(item => `
     <tr>
@@ -177,8 +187,103 @@ async function sendOrderEmail(orderData) {
       html: emailHtml
     });
     console.log(`[Email] Order confirmation email sent to ${customer.email}`);
+    return true;
   } catch (err) {
     console.error('[Email] Failed to send email:', err);
+    return false;
+  }
+}
+
+/**
+ * Persist checkout customer details when the webhook already confirmed the order.
+ * WHY: confirmOrder() ignores a second caller. The webhook passes customer=null,
+ * so the address from /verify-payment would otherwise never be stored.
+ */
+async function saveCustomerIfMissing(orderId, customer) {
+  if (!orderId || !customer || !customer.email) return;
+
+  await db.runTransaction(async (transaction) => {
+    const orderRef = db.collection('orders').doc(orderId);
+    const snap = await transaction.get(orderRef);
+    if (!snap.exists) return;
+
+    const existing = snap.data().customer;
+    if (existing && existing.email) return;
+
+    transaction.update(orderRef, {
+      customer,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  });
+}
+
+/**
+ * Send the confirmation email at most once, and only after a customer email exists.
+ * WHY: payment confirmation and email delivery are different jobs. The webhook
+ * and /verify-payment race; whichever confirmOrder() loses must still be able
+ * to send. A webhook that wins first has no customer yet, so it must not claim
+ * the email or the later /verify-payment call can never send it.
+ */
+async function sendOrderEmailOnce(orderId) {
+  if (!orderId) return;
+
+  if (!mailTransporter) {
+    console.log('[Email] Mail transporter not configured. Skipping email.');
+    return;
+  }
+
+  let noEmailYet = false;
+  let orderData = null;
+
+  try {
+    orderData = await db.runTransaction(async (transaction) => {
+      noEmailYet = false;
+      const orderRef = db.collection('orders').doc(orderId);
+      const snap = await transaction.get(orderRef);
+      if (!snap.exists) return null;
+
+      const data = snap.data();
+      if (data.confirmationEmailSent || data.confirmationEmailClaimed) return null;
+
+      const email = data.customer && data.customer.email;
+      if (!email) {
+        noEmailYet = true;
+        return null;
+      }
+
+      transaction.update(orderRef, {
+        confirmationEmailClaimed: true,
+        confirmationEmailClaimedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      return data;
+    });
+  } catch (err) {
+    console.error('[Email] Failed to claim confirmation email:', err);
+    return;
+  }
+
+  if (noEmailYet) {
+    console.log(`[Email] Order ${orderId} has no customer email yet. Will send once customer details are saved.`);
+    return;
+  }
+
+  if (!orderData) return;
+
+  const sent = await sendOrderEmail(orderData);
+  try {
+    if (sent) {
+      await db.collection('orders').doc(orderId).update({
+        confirmationEmailSent: true,
+        confirmationEmailSentAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } else {
+      // WHY: release the claim so a later webhook retry or /verify-payment can send.
+      await db.collection('orders').doc(orderId).update({
+        confirmationEmailClaimed: false
+      });
+    }
+  } catch (err) {
+    console.error('[Email] Failed to record confirmation email status:', err);
   }
 }
 
@@ -439,6 +544,54 @@ async function confirmOrder(orderId, paymentId, customer, source) {
   });
 }
 
+/**
+ * WHY: Razorpay has already taken money before confirmOrder runs.
+ * If confirmation fails (stock race, missing product), persist the
+ * captured payment so admin can refund. Do not lock or reserve stock.
+ * Never overwrite a paid order.
+ */
+async function markConfirmationRejected(orderId, paymentId, reason, customer) {
+  if (!orderId) return;
+  try {
+    const ref = db.collection('orders').doc(orderId);
+    const snap = await ref.get();
+    if (!snap.exists) return;
+    const status = snap.data().status;
+    if (status === 'paid' || status === 'captured_via_webhook' || status === 'confirmation_rejected') return;
+
+    const isStock = /out of stock/i.test(reason || '');
+    const updateData = {
+      status: 'confirmation_rejected',
+      razorpayPaymentId: paymentId || null,
+      confirmationRejectReason: reason || 'Unknown',
+      confirmationRejectKind: isStock ? 'out_of_stock' : 'confirmation_failed',
+      confirmationRejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+      needsRefund: true,
+      refunded: false,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    if (customer) updateData.customer = customer;
+    await ref.update(updateData);
+  } catch (e) {
+    console.error('[markConfirmationRejected]', e.message);
+  }
+}
+
+// WHY: Abandoned/failed/order.paid updates must not hide a captured-but-rejected payment.
+async function updateOrderStatusUnlessProtected(orderId, data) {
+  if (!orderId) return;
+  try {
+    const ref = db.collection('orders').doc(orderId);
+    const snap = await ref.get();
+    if (!snap.exists) return;
+    const status = snap.data().status;
+    if (status === 'paid' || status === 'captured_via_webhook' || status === 'confirmation_rejected') return;
+    await ref.update(Object.assign({}, data, {
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }));
+  } catch (e) { /* silent — same as previous .catch(() => {}) */ }
+}
+
 // ─── Routes ────────────────────────────────────────────────────────────────────
 
 // Health check
@@ -549,22 +702,35 @@ app.post('/verify-payment', async (req, res) => {
     // Atomically confirm order, decrement stock, and apply coupon counts
     const { alreadyProcessed } = await confirmOrder(razorpay_order_id, razorpay_payment_id, customer, 'verify_endpoint');
 
-    console.log(`[verify-payment] ✅ Order confirmed: ${razorpay_order_id} | Payment: ${razorpay_payment_id}`);
+    console.log(`[verify-payment] ✅ Order confirmed: ${razorpay_order_id} | Payment: ${razorpay_payment_id}${alreadyProcessed ? ' (already processed)' : ''}`);
 
-    // Fetch and send email confirmation (outside transaction, only if not already processed by webhook)
-    if (!alreadyProcessed) {
-      const finalSnap = await db.collection('orders').doc(razorpay_order_id).get();
-      if (finalSnap.exists) {
-        const orderData = finalSnap.data();
-        sendOrderEmail(orderData).catch(err => console.error('[verify-payment] Email failed:', err));
+    // WHY: webhook may have set status=paid before this request stored the customer.
+    // Stock must stay idempotent, but the customer and the email must still be applied.
+    if (alreadyProcessed) {
+      try {
+        await saveCustomerIfMissing(razorpay_order_id, customer);
+      } catch (saveErr) {
+        console.error('[verify-payment] Failed to save customer on already-confirmed order:', saveErr.message);
       }
     }
+
+    /* istanbul ignore next -- sendOrderEmailOnce already handles its own errors */
+    sendOrderEmailOnce(razorpay_order_id).catch(err => console.error('[verify-payment] Email failed:', err));
 
     res.json({ verified: true, orderId: razorpay_order_id, paymentId: razorpay_payment_id });
 
   } catch (err) {
     console.error('[verify-payment] Firestore error:', err.message);
-    res.status(500).json({ verified: false, error: err.message || 'Database error' });
+    await markConfirmationRejected(razorpay_order_id, razorpay_payment_id, err.message, customer);
+    const isStock = /out of stock/i.test(err.message || '');
+    res.status(500).json({
+      verified: false,
+      error: err.message || 'Database error',
+      confirmationRejected: true,
+      reason: isStock ? 'out_of_stock' : 'confirmation_failed',
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id
+    });
   }
 });
 
@@ -608,16 +774,18 @@ app.post('/webhook', async (req, res) => {
         const orderId = entity.order_id;
         const paymentId = entity.id;
 
-        // Atomically confirm order via webhook fallback
-        const { alreadyProcessed } = await confirmOrder(orderId, paymentId, null, 'webhook_fallback');
+        try {
+          // Atomically confirm order via webhook fallback
+          await confirmOrder(orderId, paymentId, null, 'webhook_fallback');
 
-        // Fetch and send email confirmation if this captured event confirmed it (and was not already processed)
-        if (!alreadyProcessed) {
-          const finalSnap = await db.collection('orders').doc(orderId).get();
-          if (finalSnap.exists) {
-            const orderData = finalSnap.data();
-            sendOrderEmail(orderData).catch(err => console.error('[webhook] Email failed:', err));
-          }
+          // WHY: do not gate email on winning confirmOrder(). This caller often
+          // arrives before customer details exist; sendOrderEmailOnce no-ops until
+          // an email is stored, then sends exactly once.
+          /* istanbul ignore next -- sendOrderEmailOnce already handles its own errors */
+          sendOrderEmailOnce(orderId).catch(err => console.error('[webhook] Email failed:', err));
+        } catch (confirmErr) {
+          await markConfirmationRejected(orderId, paymentId, confirmErr.message, null);
+          throw confirmErr;
         }
 
         break;
@@ -635,10 +803,7 @@ app.post('/webhook', async (req, res) => {
           failedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        if (orderId) {
-          await db.collection('orders').doc(orderId)
-            .update({ status: 'failed', updatedAt: admin.firestore.FieldValue.serverTimestamp() }).catch(() => { });
-        }
+        await updateOrderStatusUnlessProtected(orderId, { status: 'failed' });
 
         console.log(`[webhook] ❌ Payment failed for order ${orderId}: ${entity.error_description}`);
         break;
@@ -646,8 +811,7 @@ app.post('/webhook', async (req, res) => {
 
       case 'order.paid': {
         const orderId = entity.id;
-        await db.collection('orders').doc(orderId)
-          .update({ status: 'order_paid_webhook', updatedAt: admin.firestore.FieldValue.serverTimestamp() }).catch(() => { });
+        await updateOrderStatusUnlessProtected(orderId, { status: 'order_paid_webhook' });
         console.log(`[webhook] 📦 order.paid received for ${orderId}`);
         break;
       }
@@ -678,10 +842,7 @@ app.post('/payment-failed', async (req, res) => {
       source: 'frontend',
       failedAt: admin.firestore.FieldValue.serverTimestamp()
     });
-    if (orderId) {
-      await db.collection('orders').doc(orderId)
-        .update({ status: 'abandoned', updatedAt: admin.firestore.FieldValue.serverTimestamp() }).catch(() => { });
-    }
+    await updateOrderStatusUnlessProtected(orderId, { status: 'abandoned' });
     res.json({ logged: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -701,4 +862,10 @@ async function logFailure(orderId, reason) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`\n🐾 VASTU Payment Server running on port ${PORT}\n`));
+//* istanbul ignore if -- executed only when running node index.js */
+if (require.main === module) {
+  app.listen(PORT, () =>
+    console.log(`\n🐾 VASTU Payment Server running on port ${PORT}\n`)
+  );
+}
+module.exports = app;
