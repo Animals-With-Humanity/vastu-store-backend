@@ -86,11 +86,11 @@ const mailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_PASS) ? nod
 async function sendOrderEmail(orderData) {
   if (!mailTransporter) {
     console.log('[Email] Mail transporter not configured. Skipping email.');
-    return;
+    return false;
   }
 
   const customer = orderData.customer;
-  if (!customer || !customer.email) return;
+  if (!customer || !customer.email) return false;
 
   const itemsList = (orderData.items || []).map(item => `
     <tr>
@@ -187,8 +187,103 @@ async function sendOrderEmail(orderData) {
       html: emailHtml
     });
     console.log(`[Email] Order confirmation email sent to ${customer.email}`);
+    return true;
   } catch (err) {
     console.error('[Email] Failed to send email:', err);
+    return false;
+  }
+}
+
+/**
+ * Persist checkout customer details when the webhook already confirmed the order.
+ * WHY: confirmOrder() ignores a second caller. The webhook passes customer=null,
+ * so the address from /verify-payment would otherwise never be stored.
+ */
+async function saveCustomerIfMissing(orderId, customer) {
+  if (!orderId || !customer || !customer.email) return;
+
+  await db.runTransaction(async (transaction) => {
+    const orderRef = db.collection('orders').doc(orderId);
+    const snap = await transaction.get(orderRef);
+    if (!snap.exists) return;
+
+    const existing = snap.data().customer;
+    if (existing && existing.email) return;
+
+    transaction.update(orderRef, {
+      customer,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  });
+}
+
+/**
+ * Send the confirmation email at most once, and only after a customer email exists.
+ * WHY: payment confirmation and email delivery are different jobs. The webhook
+ * and /verify-payment race; whichever confirmOrder() loses must still be able
+ * to send. A webhook that wins first has no customer yet, so it must not claim
+ * the email or the later /verify-payment call can never send it.
+ */
+async function sendOrderEmailOnce(orderId) {
+  if (!orderId) return;
+
+  if (!mailTransporter) {
+    console.log('[Email] Mail transporter not configured. Skipping email.');
+    return;
+  }
+
+  let noEmailYet = false;
+  let orderData = null;
+
+  try {
+    orderData = await db.runTransaction(async (transaction) => {
+      noEmailYet = false;
+      const orderRef = db.collection('orders').doc(orderId);
+      const snap = await transaction.get(orderRef);
+      if (!snap.exists) return null;
+
+      const data = snap.data();
+      if (data.confirmationEmailSent || data.confirmationEmailClaimed) return null;
+
+      const email = data.customer && data.customer.email;
+      if (!email) {
+        noEmailYet = true;
+        return null;
+      }
+
+      transaction.update(orderRef, {
+        confirmationEmailClaimed: true,
+        confirmationEmailClaimedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      return data;
+    });
+  } catch (err) {
+    console.error('[Email] Failed to claim confirmation email:', err);
+    return;
+  }
+
+  if (noEmailYet) {
+    console.log(`[Email] Order ${orderId} has no customer email yet. Will send once customer details are saved.`);
+    return;
+  }
+
+  if (!orderData) return;
+
+  const sent = await sendOrderEmail(orderData);
+  try {
+    if (sent) {
+      await db.collection('orders').doc(orderId).update({
+        confirmationEmailSent: true,
+        confirmationEmailSentAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    } else {
+      // WHY: release the claim so a later webhook retry or /verify-payment can send.
+      await db.collection('orders').doc(orderId).update({
+        confirmationEmailClaimed: false
+      });
+    }
+  } catch (err) {
+    console.error('[Email] Failed to record confirmation email status:', err);
   }
 }
 
@@ -607,17 +702,20 @@ app.post('/verify-payment', async (req, res) => {
     // Atomically confirm order, decrement stock, and apply coupon counts
     const { alreadyProcessed } = await confirmOrder(razorpay_order_id, razorpay_payment_id, customer, 'verify_endpoint');
 
-    console.log(`[verify-payment] ✅ Order confirmed: ${razorpay_order_id} | Payment: ${razorpay_payment_id}`);
+    console.log(`[verify-payment] ✅ Order confirmed: ${razorpay_order_id} | Payment: ${razorpay_payment_id}${alreadyProcessed ? ' (already processed)' : ''}`);
 
-    // Fetch and send email confirmation (outside transaction, only if not already processed by webhook)
-    if (!alreadyProcessed) {
-      const finalSnap = await db.collection('orders').doc(razorpay_order_id).get();
-      if (finalSnap.exists) {
-        const orderData = finalSnap.data();
-        /* istanbul ignore next -- sendOrderEmail already handles its own errors */
-        sendOrderEmail(orderData).catch(err => console.error('[verify-payment] Email failed:', err));
+    // WHY: webhook may have set status=paid before this request stored the customer.
+    // Stock must stay idempotent, but the customer and the email must still be applied.
+    if (alreadyProcessed) {
+      try {
+        await saveCustomerIfMissing(razorpay_order_id, customer);
+      } catch (saveErr) {
+        console.error('[verify-payment] Failed to save customer on already-confirmed order:', saveErr.message);
       }
     }
+
+    /* istanbul ignore next -- sendOrderEmailOnce already handles its own errors */
+    sendOrderEmailOnce(razorpay_order_id).catch(err => console.error('[verify-payment] Email failed:', err));
 
     res.json({ verified: true, orderId: razorpay_order_id, paymentId: razorpay_payment_id });
 
@@ -678,17 +776,13 @@ app.post('/webhook', async (req, res) => {
 
         try {
           // Atomically confirm order via webhook fallback
-          const { alreadyProcessed } = await confirmOrder(orderId, paymentId, null, 'webhook_fallback');
+          await confirmOrder(orderId, paymentId, null, 'webhook_fallback');
 
-          // Fetch and send email confirmation if this captured event confirmed it (and was not already processed)
-          if (!alreadyProcessed) {
-            const finalSnap = await db.collection('orders').doc(orderId).get();
-            if (finalSnap.exists) {
-              const orderData = finalSnap.data();
-              /* istanbul ignore next -- sendOrderEmail already handles its own errors */
-              sendOrderEmail(orderData).catch(err => console.error('[webhook] Email failed:', err));
-            }
-          }
+          // WHY: do not gate email on winning confirmOrder(). This caller often
+          // arrives before customer details exist; sendOrderEmailOnce no-ops until
+          // an email is stored, then sends exactly once.
+          /* istanbul ignore next -- sendOrderEmailOnce already handles its own errors */
+          sendOrderEmailOnce(orderId).catch(err => console.error('[webhook] Email failed:', err));
         } catch (confirmErr) {
           await markConfirmationRejected(orderId, paymentId, confirmErr.message, null);
           throw confirmErr;
