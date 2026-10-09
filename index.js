@@ -61,10 +61,12 @@ app.use(cors({
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 const nodemailer = require('nodemailer');
+const https = require('https');
 
 // Setup NodeMailer Transporter
-
-const emailPort = parseInt(process.env.EMAIL_PORT || '465', 10);
+// WHY: kept for environments that can open SMTP. Render's free tier blocks
+// ports 25, 465, and 587, so production sends through the Zoho HTTPS API below.
+const emailPort = parseInt(process.env.EMAIL_PORT || '587', 10);
 const mailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_PASS) ? nodemailer.createTransport({
   host: process.env.EMAIL_HOST || 'smtp.zoho.in',
   port: emailPort,
@@ -80,17 +82,126 @@ const mailTransporter = (process.env.EMAIL_USER && process.env.EMAIL_PASS) ? nod
   }
 }) : null;
 
+function zohoMailConfigured() {
+  return !!(
+    process.env.ZOHO_CLIENT_ID &&
+    process.env.ZOHO_CLIENT_SECRET &&
+    process.env.ZOHO_REFRESH_TOKEN &&
+    process.env.ZOHO_ACCOUNT_ID
+  );
+}
+
+function emailConfigured() {
+  return zohoMailConfigured() || !!mailTransporter;
+}
+
+function bareEmail(value) {
+  const raw = String(value || '').trim();
+  const angled = raw.match(/<([^>]+)>/);
+  return (angled ? angled[1] : raw).trim();
+}
+
+function httpsJson(method, urlString, headers, body) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlString);
+    const payload = body == null ? null : Buffer.from(body);
+    const req = https.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: `${url.pathname}${url.search}`,
+      method,
+      headers: Object.assign({}, headers, payload ? { 'Content-Length': payload.length } : {})
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(20000, () => req.destroy(new Error('Zoho request timed out')));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+let zohoAccessToken = null;
+let zohoAccessTokenExpiresAt = 0;
+
+async function getZohoAccessToken() {
+  if (zohoAccessToken && Date.now() < zohoAccessTokenExpiresAt - 60000) {
+    return zohoAccessToken;
+  }
+
+  const accountsUrl = (process.env.ZOHO_ACCOUNTS_URL || 'https://accounts.zoho.in').replace(/\/$/, '');
+  const params = new URLSearchParams({
+    refresh_token: process.env.ZOHO_REFRESH_TOKEN,
+    grant_type: 'refresh_token',
+    client_id: process.env.ZOHO_CLIENT_ID,
+    client_secret: process.env.ZOHO_CLIENT_SECRET
+  });
+  const res = await httpsJson('POST', `${accountsUrl}/oauth/v2/token?${params.toString()}`);
+  let json;
+  try {
+    json = JSON.parse(res.body);
+  } catch (e) {
+    throw new Error('Zoho token response was not JSON');
+  }
+  if (!json.access_token) {
+    throw new Error(json.error || 'Zoho token refresh failed');
+  }
+
+  zohoAccessToken = json.access_token;
+  zohoAccessTokenExpiresAt = Date.now() + ((json.expires_in || 3600) * 1000);
+  return zohoAccessToken;
+}
+
+async function sendViaZoho({ to, bcc, subject, html }) {
+  const token = await getZohoAccessToken();
+  const mailUrl = (process.env.ZOHO_MAIL_URL || 'https://mail.zoho.in').replace(/\/$/, '');
+  const payload = {
+    fromAddress: bareEmail(process.env.EMAIL_FROM || 'team@awhbharat.org'),
+    toAddress: to,
+    subject,
+    content: html,
+    mailFormat: 'html'
+  };
+  if (bcc) payload.bccAddress = bcc;
+
+  const body = JSON.stringify(payload);
+  const res = await httpsJson(
+    'POST',
+    `${mailUrl}/api/accounts/${encodeURIComponent(process.env.ZOHO_ACCOUNT_ID)}/messages`,
+    {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      Authorization: `Zoho-oauthtoken ${token}`
+    },
+    body
+  );
+
+  let json = {};
+  try { json = JSON.parse(res.body); } catch (e) { /* non-JSON error page */ }
+  const apiCode = json.status && json.status.code;
+  if (res.status < 200 || res.status >= 300 || (apiCode && Number(apiCode) !== 200)) {
+    const description = (json.status && json.status.description) || res.body;
+    throw new Error(`Zoho mail API ${res.status}: ${description}`);
+  }
+}
+
 /**
  * Send customized premium order confirmation email with animal welfare support thank-you note
  */
 async function sendOrderEmail(orderData) {
-  if (!mailTransporter) {
+  const customer = orderData.customer;
+  if (!customer || !customer.email) return false;
+
+  const useZoho = zohoMailConfigured();
+  if (!useZoho && !mailTransporter) {
     console.log('[Email] Mail transporter not configured. Skipping email.');
     return false;
   }
-
-  const customer = orderData.customer;
-  if (!customer || !customer.email) return false;
 
   const itemsList = (orderData.items || []).map(item => `
     <tr>
@@ -179,17 +290,26 @@ async function sendOrderEmail(orderData) {
   `;
 
   try {
-    await mailTransporter.sendMail({
-      from: process.env.EMAIL_FROM || '"VASTU x AWH" <team@awhbharat.org>',
-      to: customer.email,
-      bcc: process.env.EMAIL_BCC,
-      subject: `🐾 Order Confirmed! - VASTU x AWH`,
-      html: emailHtml
-    });
+    if (useZoho) {
+      await sendViaZoho({
+        to: customer.email,
+        bcc: process.env.EMAIL_BCC,
+        subject: '🐾 Order Confirmed! - VASTU x AWH',
+        html: emailHtml
+      });
+    } else {
+      await mailTransporter.sendMail({
+        from: process.env.EMAIL_FROM || '"VASTU x AWH" <team@awhbharat.org>',
+        to: customer.email,
+        bcc: process.env.EMAIL_BCC,
+        subject: `🐾 Order Confirmed! - VASTU x AWH`,
+        html: emailHtml
+      });
+    }
     console.log(`[Email] Order confirmation email sent to ${customer.email}`);
     return true;
   } catch (err) {
-    console.error('[Email] Failed to send email:', err);
+    console.error('[Email] Failed to send email:', err.message);
     return false;
   }
 }
@@ -228,7 +348,7 @@ function payerFromPaymentEntity(entity) {
 async function sendOrderEmailOnce(orderId) {
   if (!orderId) return;
 
-  if (!mailTransporter) {
+  if (!emailConfigured()) {
     console.log('[Email] Mail transporter not configured. Skipping email.');
     return;
   }
