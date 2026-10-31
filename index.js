@@ -981,6 +981,21 @@ app.post('/payment-failed', async (req, res) => {
   }
 });
 
+// ─── Diwali Gift (self-contained; delete this block + gift.js to remove) ───────
+require('./gift')(app, {
+  db,
+  admin,
+  sendMail: async ({ to, bcc, subject, html }) => {
+    if (zohoMailConfigured()) return sendViaZoho({ to, bcc, subject, html });
+    if (mailTransporter) {
+      return mailTransporter.sendMail({
+        from: process.env.EMAIL_FROM || '"VASTU x AWH" <team@awhbharat.org>',
+        to, bcc, subject, html
+      });
+    }
+  }
+});
+
 // ─── Start ─────────────────────────────────────────────────────────────────────
 async function logFailure(orderId, reason) {
   try {
